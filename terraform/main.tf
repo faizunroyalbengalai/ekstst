@@ -199,8 +199,73 @@ resource "aws_security_group" "eks_nodes" {
     security_groups = [aws_security_group.eks_cluster.id]
   }
 
-  ingress {
-    from_port = 0
-    to_port   = 0
-    protocol  = "-1"
-    self      = true
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name      = "${var.project_name}-eks-nodes-sg"
+    Project   = var.project_name
+    ManagedBy = "devops-agent"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_eks_cluster" "main" {
+  name     = "${var.project_name}-cluster"
+  role_arn = aws_iam_role.eks_cluster.arn
+
+  vpc_config {
+    subnet_ids         = data.aws_subnets.default.ids
+    security_group_ids = [aws_security_group.eks_cluster.id]
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy,
+    aws_iam_role_policy_attachment.eks_vpc_resource_controller,
+  ]
+
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "devops-agent"
+  }
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.project_name}-node-group"
+  node_role_arn   = aws_iam_role.eks_node_group.arn
+  subnet_ids      = data.aws_subnets.default.ids
+  instance_types  = [var.node_instance_type]
+
+  scaling_config {
+    desired_size = var.desired_capacity
+    min_size     = var.min_size
+    max_size     = var.max_size
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.eks_container_registry_policy,
+  ]
+
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "devops-agent"
+  }
+}
+
+output "cluster_name" {
+  value = aws_eks_cluster.main.name
+}
+
+output "cluster_endpoint" {
+  value = aws_eks_cluster.main.endpoint
+}
