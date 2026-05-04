@@ -1,0 +1,358 @@
+name: Deploy node to Kubernetes
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: node
+  PROJECT_NAME: ekstst
+
+jobs:
+  provision:
+    name: Provision EKS Cluster
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_name: ${{ steps.tf_outputs.outputs.cluster_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="app_name=${{ env.APP_NAME }}"
+
+      - name: Get Terraform Outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+          echo "cluster_name=${CLUSTER_NAME}" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Build and Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run build if present
+        run: |
+          if grep -q '"build"' package.json; then
+            npm run build
+          fi
+
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ env.PROJECT_NAME }}-${{ env.APP_NAME }}" \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "${{ env.PROJECT_NAME }}-${{ env.APP_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Build and push Docker image
+        id: build_image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr_login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${{ env.PROJECT_NAME }}-${{ env.APP_NAME }}:${IMAGE_TAG}"
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ needs.provision.outputs.cluster_name }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Create Kubernetes namespace
+        run: |
+          kubectl get namespace "${{ env.PROJECT_NAME }}" 2>/dev/null || \
+          kubectl create namespace "${{ env.PROJECT_NAME }}"
+
+      - name: Deploy to Kubernetes
+        env:
+          IMAGE_URI: ${{ steps.build_image.outputs.image_uri }}
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.PROJECT_NAME }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              project: ${{ env.PROJECT_NAME }}
+              managed-by: devops-agent
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{ env.APP_NAME }}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.APP_NAME }}
+                  project: ${{ env.PROJECT_NAME }}
+              spec:
+                containers:
+                  - name: ${{ env.APP_NAME }}
+                    image: ${IMAGE_URI}
+                    ports:
+                      - containerPort: 3000
+                    env:
+                      - name: PORT
+                        value: "3000"
+                      - name: NODE_ENV
+                        value: "production"
+                    command: ["npm", "start"]
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 3000
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      failureThreshold: 6
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 3000
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      failureThreshold: 3
+                    resources:
+                      requests:
+                        cpu: "100m"
+                        memory: "128Mi"
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
+          EOF
+
+      - name: Apply Kubernetes Service
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.APP_NAME }}-service
+            namespace: ${{ env.PROJECT_NAME }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              project: ${{ env.PROJECT_NAME }}
+              managed-by: devops-agent
+          spec:
+            selector:
+              app: ${{ env.APP_NAME }}
+            ports:
+              - name: http
+                protocol: TCP
+                port: 80
+                targetPort: 3000
+            type: LoadBalancer
+          EOF
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            --namespace "${{ env.PROJECT_NAME }}" \
+            --timeout=300s
+
+      - name: Wait for LoadBalancer hostname
+        id: lb_hostname
+        run: |
+          echo "Waiting for LoadBalancer external hostname..."
+          for i in $(seq 1 30); do
+            HOSTNAME=$(kubectl get svc ${{ env.APP_NAME }}-service \
+              --namespace "${{ env.PROJECT_NAME }}" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "${HOSTNAME}" ]; then
+              echo "LoadBalancer hostname: ${HOSTNAME}"
+              echo "lb_hostname=${HOSTNAME}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "Attempt ${i}/30 — waiting 10s..."
+            sleep 10
+          done
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ needs.provision.outputs.cluster_name }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Get LoadBalancer hostname
+        id: get_lb
+        run: |
+          HOSTNAME=$(kubectl get svc ${{ env.APP_NAME }}-service \
+            --namespace "${{ env.PROJECT_NAME }}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          echo "lb_hostname=${HOSTNAME}" >> "$GITHUB_OUTPUT"
+          echo "LoadBalancer hostname: ${HOSTNAME}"
+
+      - name: Health check via LoadBalancer
+        run: |
+          LB_HOST="${{ steps.get_lb.outputs.lb_hostname }}"
+          if [ -z "${LB_HOST}" ]; then
+            echo "WARNING: LoadBalancer hostname not yet available, running internal health check"
+            POD=$(kubectl get pods \
+              --namespace "${{ env.PROJECT_NAME }}" \
+              -l app=${{ env.APP_NAME }} \
+              -o jsonpath='{.items[0].metadata.name}')
+            kubectl exec "${POD}" \
+              --namespace "${{ env.PROJECT_NAME }}" \
+              -- curl -sf http://localhost:3000/health
+          else
+            echo "Waiting for DNS propagation and service readiness..."
+            for i in $(seq 1 20); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 10 \
+                "http://${LB_HOST}/health" 2>/dev/null || true)
+              if [ "${STATUS}" = "200" ]; then
+                echo "Health check passed with HTTP ${STATUS}"
+                break
+              fi
+              echo "Attempt ${i}/20 — HTTP ${STATUS}, retrying in 15s..."
+              sleep 15
+            done
+            FINAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "http://${LB_HOST}/health" 2>/dev/null || true)
+            if [ "${FINAL_STATUS}" != "200" ]; then
+              echo "ERROR: Health check failed with HTTP ${FINAL_STATUS}"
+              kubectl get pods --namespace "${{ env.PROJECT_NAME }}" -l app=${{ env.APP_NAME }}
+              kubectl logs --namespace "${{ env.PROJECT_NAME }}" \
+                -l app=${{ env.APP_NAME }} --tail=50
+              exit 1
+            fi
+          fi
+
+      - name: Show pod status
+        if: always()
+        run: |
+          kubectl get pods \
+            --namespace "${{ env.PROJECT_NAME }}" \
+            -l app=${{ env.APP_NAME }} \
+            -o wide
+          kubectl get svc \
+            --namespace "${{ env.PROJECT_NAME }}"
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ needs.provision.outputs.cluster_name }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Get LoadBalancer hostname for summary
+        id: get_lb_final
+        run: |
+          HOSTNAME=$(kubectl get svc ${{ env.APP_NAME }}-service \
+            --namespace "${{ env.PROJECT_NAME }}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          echo "lb_hostname=${HOSTNAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Deployment summary
+        run: |
+          VERIFY_RESULT="${{ needs.verify.result }}"
+          LB_HOST="${{ steps.get_lb_final.outputs.lb_hostname }}"
+          echo "============================================"
+          echo "  Deployment Summary"
+          echo "============================================"
+          echo "  Project      : ${{ env.PROJECT_NAME }}"
+          echo "  App          : ${{ env.APP_NAME }}"
+          echo "  Region       : ${{ env.AWS_REGION }}"
+          echo "  Cluster      : ${{ needs.provision.outputs.cluster_name }}"
+          echo "  Namespace    : ${{ env.PROJECT_NAME }}"
+          echo "  Image Tag    : ${{ github.sha }}"
+          echo "  Status       : ${VERIFY_RESULT}"
+          if [ -n "${LB_HOST}" ]; then
+            echo "  Endpoint     : http://${LB_HOST}"
+            echo "  Health URL   : http://${LB_HOST}/health"
+          fi
+          echo "============================================"
+          if [ "${VERIFY_RESULT}" != "success" ]; then
+            echo "ERROR: Deployment verification failed"
+            exit 1
+          fi
+          echo "Deployment completed successfully"
