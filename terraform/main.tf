@@ -95,6 +95,11 @@ data "aws_subnets" "default" {
   }
 }
 
+data "aws_subnet" "default" {
+  for_each = toset(data.aws_subnets.default.ids)
+  id       = each.value
+}
+
 data "aws_caller_identity" "current" {}
 
 data "aws_iam_policy_document" "eks_assume_role" {
@@ -217,13 +222,23 @@ resource "aws_security_group" "eks_nodes" {
   }
 }
 
+locals {
+  eks_supported_azs = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1f"]
+  filtered_subnet_ids = [
+    for s in data.aws_subnet.default : s.id
+    if contains(local.eks_supported_azs, s.availability_zone)
+  ]
+}
+
 resource "aws_eks_cluster" "main" {
   name     = "${var.project_name}-cluster"
   role_arn = aws_iam_role.eks_cluster.arn
 
   vpc_config {
-    subnet_ids         = data.aws_subnets.default.ids
-    security_group_ids = [aws_security_group.eks_cluster.id]
+    subnet_ids              = local.filtered_subnet_ids
+    security_group_ids      = [aws_security_group.eks_cluster.id]
+    endpoint_private_access = true
+    endpoint_public_access  = true
   }
 
   depends_on = [
@@ -241,13 +256,13 @@ resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.project_name}-node-group"
   node_role_arn   = aws_iam_role.eks_node_group.arn
-  subnet_ids      = data.aws_subnets.default.ids
+  subnet_ids      = local.filtered_subnet_ids
   instance_types  = [var.node_instance_type]
 
   scaling_config {
     desired_size = var.desired_capacity
-    min_size     = var.min_size
     max_size     = var.max_size
+    min_size     = var.min_size
   }
 
   depends_on = [
@@ -268,4 +283,8 @@ output "cluster_name" {
 
 output "cluster_endpoint" {
   value = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_certificate_authority" {
+  value = aws_eks_cluster.main.certificate_authority[0].data
 }
